@@ -66,4 +66,3 @@ if selected_file.getName() == 'cyberpunk2077_addresses.json':
         currentProgram.endTransaction(transaction, True)
 else:
     printerr("File selected is not 'cyberpunk2077_addresses.json'")
-

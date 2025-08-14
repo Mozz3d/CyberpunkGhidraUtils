@@ -6,36 +6,26 @@
 #@toolbar 
 
 import json
-from ghidra.program.model.symbol import SymbolTable, Namespace, SourceType
+
+import re
+
 from ghidra.program.model.address import Address, AddressSet
 from ghidra.program.model.data import DataType, StringDataType, Undefined4DataType
+from ghidra.program.model.symbol import SymbolTable, Namespace, SourceType
+
 from ghidra.program.util import ProgramLocation
+
 from ghidra.app.util import XReferenceUtils
+from ghidra.app.util.demangler.microsoft import MicrosoftDemangler, MicrosoftMangledContext, MicrosoftDemanglerOptions
+
+from ghidra.util.task import TaskMonitor
 from ghidra.util.exception import CancelledException
 
-from java.net import URL, HttpURLConnection
-from java.io import BufferedReader, InputStreamReader
-
-def fetch(urlStr):
-    url = URL(urlStr)
-    connection = url.openConnection();
-    connection.setRequestMethod("GET");
-    connection.connect();
-    
-    reader = BufferedReader(InputStreamReader(connection.getInputStream()))
-    content = []
-    line = reader.readLine()
-    while line:
-        content.append(line)
-        line = reader.readLine()
-        reader.close()
-    connection.disconnect();
-    
-    return json.loads("\n".join(content))
 
 symbolTable = currentProgram.getSymbolTable()
 listing = currentProgram.getListing()
-
+monitor.addCancelledListener(monitor.cancel)
+demangler = MicrosoftDemangler()
 allNamespaces = {
     "AI": {
         "behavior": {
@@ -206,10 +196,37 @@ allNamespaces = {
         "ui": {}
     }
 }
+hashAddrBlocks = []
+for i, block in enumerate(getMemoryBlocks()):
+    hashAddrMap = {}
+    for addr in listing.getCommentAddressIterator( AddressSet( block.getStart(), block.getEnd() ), True):
+        comment = getPlateComment(addr)
+        if comment and "Hash" in comment:
+            match = re.search(r'Hash: (\d+)', comment)
+            if match:
+                _hash = int(match.group(1))
+                hashAddrMap[_hash] = addr
+    hashAddrBlocks.insert(i, hashAddrMap)
+
 
 def setLabel(address, namespace, name):
     newLabel = createLabel(address, name, namespace, False, SourceType.USER_DEFINED)
     printf(getScriptName() + "> Derived symbol: %s::%s at %s\n", namespace, newLabel, address)
+
+
+def setDemangledLabel(address, mangledString):
+    context = demangler.createMangledContext(mangledString, None, None, None)
+    demangled = demangler.demangle(context)
+    
+    demangled.applyTo(currentProgram, address, demangler.createDefaultOptions(), monitor)
+    createLabel(address, mangledString, False, SourceType.ANALYSIS)
+    
+    # hack cause Ghidras MicrosoftDemangler result seems to incorrectly apply `__thiscall` for every signature
+    func = getFunctionAt(address)
+    if func:
+        func.setCallingConvention('__cdecl')
+    
+    printf(getScriptName() + "> Derived: `%s`at %s\n", demangled, address)
 
 
 def parseSymbol(conjoinedSymbol):
@@ -244,41 +261,116 @@ def createNamespacesFromSymbol(symbol):
     for namespace in namespaces:
         currentNamespace = symbolTable.getOrCreateNameSpace(currentNamespace, namespace, SourceType.USER_DEFINED)
     
-    return symbolTable.convertNamespaceToClass(currentNamespace)
-    
-def locateHash(nameHash, addressSet):
-    for addr in listing.getCommentAddressIterator(addressSet, True):
-        comment = getPlateComment(addr)
-        if comment and str(nameHash) in comment:
-            return addr
-    
+    return currentNamespace
 
-def deriveRttiTypeSymbols():
-    #
-    # Locate rtti::ClassType::ClassType
-    #
-    classTypeCtor_hash = "3794668520"
-    classTypeCtor_addr = None
 
-    printf(getScriptName() + "> Locating `rtti::ClassType::ClassType`(%s)\n", classTypeCtor_hash)
-    
-    codeBlock = getMemoryBlocks()[1]
-    classTypeCtor_addr = locateHash(classTypeCtor_hash, AddressSet( codeBlock.getStart(), codeBlock.getEnd() ))
-    
-    if classTypeCtor_addr is None:
-        printerr("Could not locate rtti::ClassType::ClassType ({}); are hashes imported?".format(classTypeCtor_hash))
-        return
-    
-    printf("Located at %s\n", classTypeCtor_addr)
-    createFunction(classTypeCtor_addr, None)
-    setLabel(classTypeCtor_addr, createNamespacesFromSymbol('rtti::ClassType'), 'ClassType')
+def adler32(data):
+    MOD_ADLER = 65521
+    a = 1
+    b = 0
 
+    for byte in data:
+        a = (a + ord(byte)) % MOD_ADLER
+        b = (b + a) % MOD_ADLER
+
+    return (b << 16) | a
+
+
+def locateClassTypeConstructor():
+    ctorHash = 3794668520
     
-    #
-    # Iterate through rtti::ClassType::ClassType references to find derived types + generate symbols
-    #
+    printf(getScriptName() + "> Locating `rtti::ClassType::ClassType`(%s)\n", ctorHash)
+    addr = hashAddrBlocks[1].get(ctorHash)
+    if addr:
+        printf(getScriptName() + "> Located `rtti::ClassType::ClassType`(%s) at %s\n", ctorHash, addr)
+        createFunction(addr, None)
+        setLabel(addr, createNamespacesFromSymbol('rtti::ClassType'), 'ClassType')
+        return addr
+    
+  
+    printerr("Could not locate rtti::ClassType::ClassType ({}); are hashes imported?".format(ctorHash))
+    return
+
+
+def mangleClassTypeFuncs(typenameStr):
+    qualDecorated = '@'.join(reversed(typenameStr.split(Namespace.DELIMITER)))
+    return [
+        "??_G{}@@UEAAPEAXI@Z".format(qualDecorated),
+        "?RegisterProperties@{}@@SAXPEAVClassType@rtti@@@Z".format(qualDecorated)
+    ]
+
+
+def mangleClassTypeVFT(typenameStr):
+    qualDecorated = '@'.join(reversed(typenameStr.split(Namespace.DELIMITER)))
+    return [
+        "??_7{}@@6B@".format(qualDecorated)
+    ]
+
+
+def mangleClassTypeData(typenameStr):
+    qualDecorated = '@'.join(reversed(typenameStr.split(Namespace.DELIMITER)))
+    return [
+        "?sm_classDesc@{}@@0PEBVClassType@rtti@@EB".format(qualDecorated)
+    ]
+
+
+def mangleRTTINativeTypeNoCopyFuncs(wrappedTypenameStr):
+    qualDecorated = '@'.join(reversed(wrappedTypenameStr.split(Namespace.DELIMITER)))
+    return [
+        "?OnConstruct@?$TNativeClassNoCopy@V{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
+        "?OnDestruct@?$TNativeClassNoCopy@V{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
+        "?OnConstruct@?$TNativeClassNoCopy@U{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
+        "?OnDestruct@?$TNativeClassNoCopy@U{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated)
+    ]
+
+
+def mangleRTTINativeTypeNoCopyVFT(wrappedTypenameStr):
+    qualDecorated = '@'.join(reversed(wrappedTypenameStr.split(Namespace.DELIMITER)))
+    return [
+        "??_7?$TNativeClassNoCopy@V{}@@@rtti@@6B@".format(qualDecorated),
+        "??_7?$TNativeClassNoCopy@U{}@@@rtti@@6B@".format(qualDecorated)
+    ]
+        
+
+def mangleRTTINativeTypeFuncs(wrappedTypenameStr):
+    qualDecorated = '@'.join(reversed(wrappedTypenameStr.split(Namespace.DELIMITER)))
+    return [
+        "?OnConstruct@?$TNativeClass@V{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
+        "?OnDestruct@?$TNativeClass@V{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
+        "?OnConstruct@?$TNativeClass@U{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
+        "?OnDestruct@?$TNativeClass@U{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated)
+    ]
+
+def mangleRTTINativeTypeVFT(wrappedTypenameStr):
+    qualDecorated = '@'.join(reversed(wrappedTypenameStr.split(Namespace.DELIMITER)))
+    return [
+        "??_7?$TNativeClass@V{}@@@rtti@@6B@".format(qualDecorated),
+        "??_7?$TNativeClass@U{}@@@rtti@@6B@".format(qualDecorated)
+    ]
+
+
+def mangleRTTITypeFuncs(typenameStr):
+    return mangleRTTINativeTypeNoCopyFuncs(typenameStr) + mangleRTTINativeTypeFuncs(typenameStr) + mangleClassTypeFuncs(typenameStr)
+
+
+def mangleRTTITypeVFTs(typenameStr):
+    return mangleRTTINativeTypeNoCopyVFT(typenameStr) + mangleRTTINativeTypeVFT(typenameStr) + mangleClassTypeVFT(typenameStr)
+
+
+def mangleRTTITypeData(typenameStr):
+    return mangleClassTypeData(typenameStr)
+    
+#
+# Entry
+#
+shouldCommit = False
+transaction = currentProgram.startTransaction("Derive RTTI Class Symbols")
+try:
     numClasses = 0
-    for xref in XReferenceUtils.getAllXrefs(ProgramLocation(currentProgram, classTypeCtor_addr)):
+    numSymbols = 0
+    
+    for xref in XReferenceUtils.getAllXrefs(ProgramLocation(currentProgram, locateClassTypeConstructor())):
+        monitor.checkCanceled()
         
         currentInstruction = getInstructionAt(xref.getFromAddress())
         if currentInstruction is None:
@@ -303,47 +395,43 @@ def deriveRttiTypeSymbols():
 
         if symbol is None:
             continue
-
-        symbol = parseSymbol(symbol.replace('"', ''))
-        typeNamespace = createNamespacesFromSymbol(symbol)
         
-        rttiNamespace = symbolTable.getOrCreateNameSpace(currentProgram.getGlobalNamespace(), 'rtti', SourceType.USER_DEFINED)
-        typedClass_name = createClass(rttiNamespace, "TTypedClass<{0}>".format(symbol))
+        qualifiedSymbol = parseSymbol(symbol.replace('"', ''))
         
         
-        currentInstruction = getInstructionAt(xref.getFromAddress())
-        for i in range(8):
-            currentInstruction = currentInstruction.getNext()
+        funcsHashMap = {adler32(mangled): mangled for mangled in mangleRTTITypeFuncs(qualifiedSymbol)}
+        for _hash in funcsHashMap.keys():
+            addr = hashAddrBlocks[1].get(_hash)
+            if addr:
+                setDemangledLabel(addr, funcsHashMap[_hash])
+                numSymbols += 1
         
-            if i == 0:
-                classType_vftable = currentInstruction.getReferencesFrom()[0].getToAddress()
-                setLabel(classType_vftable, typedClass_name, 'vftable')
-            elif i == 2:
-                registeredClass_addr = currentInstruction.getReferencesFrom()[0].getToAddress()
-                setLabel(registeredClass_addr, typeNamespace, 'registeredClass')
-            elif i == 7:
-                classDesc_addr = currentInstruction.getReferencesFrom()[0].getToAddress()
-                setLabel(classDesc_addr, typeNamespace, 'sm_classDesc')
+        rdataHashMap = {adler32(mangled): mangled for mangled in mangleRTTITypeVFTs(qualifiedSymbol)}
+        for _hash in rdataHashMap.keys():
+            addr = hashAddrBlocks[2].get(_hash)
+            if addr:
+                setDemangledLabel(addr, rdataHashMap[_hash])
+                numSymbols += 1
         
-        onConstruct_addr = getReferencesFrom(classType_vftable.add(216))[0].getToAddress()
-        if "Dump" not in symbolTable.getPrimarySymbol(onConstruct_addr).toString():
-            createFunction(onConstruct_addr, None)
-            setLabel(onConstruct_addr, typedClass_name, 'OnConstruct')
+        dataHashMap = {adler32(mangled): mangled for mangled in mangleRTTITypeData(qualifiedSymbol)}
+        for _hash in dataHashMap.keys():
+            addr = hashAddrBlocks[3].get(_hash)
+            if addr:
+                setDemangledLabel(addr, dataHashMap[_hash])
+                numSymbols += 1
         
         
-        onDestruct_addr = getReferencesFrom(classType_vftable.add(224))[0].getToAddress()
-        if "Dump" not in symbolTable.getPrimarySymbol(onDestruct_addr).toString():
-            createFunction(onDestruct_addr, None)
-            setLabel(onDestruct_addr, typedClass_name, 'OnDestruct')
+        # hack for finding `registeredClass` because I can't figure out it's mangling
+        currentInstruction = getInstructionAt(xref.getFromAddress()).getNext().getNext().getNext()
+        registeredClass_addr = currentInstruction.getReferencesFrom()[0].getToAddress()
+        if registeredClass_addr:
+            setLabel(registeredClass_addr, createNamespacesFromSymbol(qualifiedSymbol), 'registeredClass')
+            numSymbols += 1
 
         numClasses += 1
-    printf(getScriptName() + "> Derived %d RTTI classes\n", numClasses)
 
-#
-# Entry
-#
-transaction = currentProgram.startTransaction("Derive RTTI Class Symbols")
-try:
-    deriveRttiTypeSymbols()
+    printf(getScriptName() + "> Found %d RTTI classes\n", numClasses)
+    printf(getScriptName() + "> Derived %d symbols\n", numSymbols)
+    shouldCommit = True
 finally:
-    currentProgram.endTransaction(transaction, True)
+    currentProgram.endTransaction(transaction, shouldCommit)

@@ -211,7 +211,7 @@ for i, block in enumerate(getMemoryBlocks()):
 
 def setLabel(address, namespace, name):
     newLabel = createLabel(address, name, namespace, False, SourceType.USER_DEFINED)
-    printf(getScriptName() + "> Derived symbol: %s::%s at %s\n", namespace, newLabel, address)
+    printf(getScriptName() + "> Derived: `%s::%s` at %s\n", namespace, newLabel, address)
 
 
 def setDemangledLabel(address, mangledString):
@@ -224,7 +224,7 @@ def setDemangledLabel(address, mangledString):
     
     createLabel(address, mangledString, False, SourceType.ANALYSIS)
     
-    printf(getScriptName() + "> Derived: `%s`at %s\n", demangled, address)
+    printf(getScriptName() + "> Derived: `%s` at %s\n", demangled, address)
 
 
 def parseSymbol(conjoinedSymbol):
@@ -299,6 +299,8 @@ def mangleClassTypeFuncs(typenameStr):
         "??_G{}@@UEAAPEAXI@Z".format(qualDecorated),
         "??1{}@@UEAA@XZ".format(qualDecorated),
         "??1{}@@QEAA@XZ".format(qualDecorated),
+        "?GetNativeClass@{}@@UEBAPEBVClassType@rtti@@XZ".format(qualDecorated),
+        "?GetClass@{}@@UEBAPEBVClassType@rtti@@XZ".format(qualDecorated),
         "?RegisterProperties@{}@@SAXPEAVClassType@rtti@@@Z".format(qualDecorated)
     ]
 
@@ -335,7 +337,7 @@ def mangleRTTINativeTypeNoCopyVFT(wrappedTypenameStr):
         "??_7?$TNativeClassNoCopy@V{}@@@rtti@@6B@".format(qualDecorated),
         "??_7?$TNativeClassNoCopy@U{}@@@rtti@@6B@".format(qualDecorated)
     ]
-        
+
 
 def mangleRTTINativeTypeFuncs(wrappedTypenameStr):
     qualDecorated = '@'.join(reversed(wrappedTypenameStr.split(Namespace.DELIMITER)))
@@ -347,6 +349,7 @@ def mangleRTTINativeTypeFuncs(wrappedTypenameStr):
         "?OnConstruct@?$TNativeClass@U{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
         "?OnDestruct@?$TNativeClass@U{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated)
     ]
+
 
 def mangleRTTINativeTypeVFT(wrappedTypenameStr):
     qualDecorated = '@'.join(reversed(wrappedTypenameStr.split(Namespace.DELIMITER)))
@@ -427,17 +430,15 @@ try:
                 setDemangledLabel(addr, dataHashMap[_hash])
                 numSymbols += 1
         
-        
         # hack for finding `registeredClass` because I can't figure out it's mangling
-        currentInstruction = getInstructionAt(xref.getFromAddress()).getNext().getNext().getNext()
-        registeredClass_addr = currentInstruction.getReferencesFrom()[0].getToAddress()
+        registeredClass_addr = getInstructionAt(xref.getFromAddress()).getNext().getNext().getNext().getReferencesFrom()[0].getToAddress()
         if registeredClass_addr:
             setLabel(registeredClass_addr, createNamespacesFromSymbol(qualifiedSymbol), 'registeredClass')
             numSymbols += 1
 
         numClasses += 1
 
-    printf(getScriptName() + "> Found %d RTTI classes\n", numClasses)
+    printf(getScriptName() + "> Found %d RTTI types\n", numClasses)
     printf(getScriptName() + "> Derived %d symbols\n", numSymbols)
     shouldCommit = True
 finally:

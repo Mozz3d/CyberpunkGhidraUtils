@@ -215,16 +215,14 @@ def setLabel(address, namespace, name):
 
 
 def setDemangledLabel(address, mangledString):
-    context = demangler.createMangledContext(mangledString, None, None, None)
+    options = demangler.createDefaultOptions()
+    options.setApplySignature(False)
+    options.setApplyCallingConvention(False)
+    context = demangler.createMangledContext(mangledString, options, currentProgram, address)
     demangled = demangler.demangle(context)
+    demangled.applyTo(currentProgram, address, options, monitor)
     
-    demangled.applyTo(currentProgram, address, demangler.createDefaultOptions(), monitor)
     createLabel(address, mangledString, False, SourceType.ANALYSIS)
-    
-    # hack cause Ghidras MicrosoftDemangler result seems to incorrectly apply `__thiscall` for every signature
-    func = getFunctionAt(address)
-    if func:
-        func.setCallingConvention('__cdecl')
     
     printf(getScriptName() + "> Derived: `%s`at %s\n", demangled, address)
 
@@ -295,7 +293,12 @@ def locateClassTypeConstructor():
 def mangleClassTypeFuncs(typenameStr):
     qualDecorated = '@'.join(reversed(typenameStr.split(Namespace.DELIMITER)))
     return [
+        "??0{}@@QEAA@XZ".format(qualDecorated),
+        "??0{}@@AEAA@XZ".format(qualDecorated),
+        "??0{}@@IEAA@XZ".format(qualDecorated),
         "??_G{}@@UEAAPEAXI@Z".format(qualDecorated),
+        "??1{}@@UEAA@XZ".format(qualDecorated),
+        "??1{}@@QEAA@XZ".format(qualDecorated),
         "?RegisterProperties@{}@@SAXPEAVClassType@rtti@@@Z".format(qualDecorated)
     ]
 
@@ -317,6 +320,8 @@ def mangleClassTypeData(typenameStr):
 def mangleRTTINativeTypeNoCopyFuncs(wrappedTypenameStr):
     qualDecorated = '@'.join(reversed(wrappedTypenameStr.split(Namespace.DELIMITER)))
     return [
+        "??1?$TNativeClassNoCopy@V{}@@@rtti@@UEAA@XZ".format(qualDecorated),
+        "??1?$TNativeClassNoCopy@U{}@@@rtti@@UEAA@XZ".format(qualDecorated),
         "?OnConstruct@?$TNativeClassNoCopy@V{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
         "?OnDestruct@?$TNativeClassNoCopy@V{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
         "?OnConstruct@?$TNativeClassNoCopy@U{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
@@ -335,6 +340,8 @@ def mangleRTTINativeTypeNoCopyVFT(wrappedTypenameStr):
 def mangleRTTINativeTypeFuncs(wrappedTypenameStr):
     qualDecorated = '@'.join(reversed(wrappedTypenameStr.split(Namespace.DELIMITER)))
     return [
+        "??1?$TNativeClass@V{}@@@rtti@@UEAA@XZ".format(qualDecorated),
+        "??1?$TNativeClass@U{}@@@rtti@@UEAA@XZ".format(qualDecorated),
         "?OnConstruct@?$TNativeClass@V{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
         "?OnDestruct@?$TNativeClass@V{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),
         "?OnConstruct@?$TNativeClass@U{}@@@rtti@@EEBAXPEAX@Z".format(qualDecorated),

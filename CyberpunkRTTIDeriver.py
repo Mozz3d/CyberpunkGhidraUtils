@@ -20,6 +20,7 @@ from ghidra.app.util.demangler.microsoft import MicrosoftDemangler, MicrosoftMan
 monitor.addCancelledListener(monitor.cancel)
 listing = currentProgram.getListing()
 demangler = MicrosoftDemangler()
+errors = []
 
 hashAddrMapsByBlock = []
 for i, block in enumerate(getMemoryBlocks()):
@@ -45,16 +46,18 @@ def sha256(data):
 
 
 def setDemangledLabel(address, mangledString):
-    options = demangler.createDefaultOptions()
-    options.setApplySignature(False)
-    options.setApplyCallingConvention(False)
-    context = demangler.createMangledContext(mangledString, options, currentProgram, address)
-    demangled = demangler.demangle(context)
-    demangled.applyTo(currentProgram, address, options, monitor)
-    
-    createLabel(address, mangledString, False, SourceType.ANALYSIS)
-    
-    println("Derived `{}` at {}".format(demangled, address))
+    try:
+        options = demangler.createDefaultOptions()
+        options.setApplySignature(False)
+        options.setApplyCallingConvention(False)
+        context = demangler.createMangledContext(mangledString, options, currentProgram, address)
+        demangled = demangler.demangle(context)
+        demangled.applyTo(currentProgram, address, options, monitor)
+        createLabel(address, mangledString, False, SourceType.ANALYSIS)
+        
+        println("Derived `{}` at {}".format(demangled, address))
+    except java.lang.Exception as e:
+        errors.append("Could not apply demangled label '{}' at {}: {}".format(str(demangled).strip(), address, e))
 
 #
 # Entry
@@ -146,7 +149,7 @@ try:
                     break
         
         if not classDesc_addr:
-            printerr("Could not find 'sm_classDesc' for '{}'".format(conjoinedName))
+            errors.append("Could not find 'sm_classDesc' for '{}'".format(conjoinedName))
             continue
 
         setDemangledLabel(classDesc_addr, classDesc_mangled)
@@ -233,7 +236,7 @@ try:
                 eventQualifiedName = str(dataSymbol.getParentNamespace())
      
         if eventQualifiedName is None:
-            printerr("Could not find event class descriptor")
+            errors.append("Could not find event class descriptor")
             continue
             
         for regProp_func in regEventConncector_func.getCallingFunctions(monitor):
@@ -283,6 +286,8 @@ try:
             #    # fallback because there's some other version of RegisterEventConnector I can't figure out
             #    setLabel(addr, getNamespace(None, 'rtti'), 'RegisterEventConnector<{},{}>'.format(typeQualifiedName, eventQualifiedName))
             #    numSymbols += 1  
+    for err in errors:
+        printerr(err)
     println("Found {} RTTI declared classes".format(numFound))
     println("Derived {} symbols".format(numSymbols))
     shouldCommit = True

@@ -62,12 +62,12 @@ def setDemangledLabel(address, mangledString):
 classType_ctor_name = '??0ClassType@rtti@@QEAA@VCName@@II@Z'
 classType_ctor_hash = sha256(classType_ctor_name)
 classType_ctor_addr = hashAddrMapsByBlock[1].get(classType_ctor_hash)
-classType_ctor_func = getFunctionAt(classType_ctor_addr)
 
 if classType_ctor_addr is None:
     printerr("Could not locate `rtti::ClassType::ClassType`, are hashes imported?")
     exit(1)
 
+classType_ctor_func = getFunctionAt(classType_ctor_addr)
 println("Located `rtti::ClassType::ClassType` at {}".format(classType_ctor_addr))
 
 shouldCommit = False

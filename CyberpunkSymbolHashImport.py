@@ -53,7 +53,8 @@ crtBuiltInMap = {
     145621625: 'malloc',
     146997900: 'memcpy',
     148374156: 'memset',
-    1099040519: 'wWinMainCRTStartup'
+    1099040519: 'wWinMainCRTStartup',
+    388826167: 'quick_exit'
 }
 
 shouldCommit = False

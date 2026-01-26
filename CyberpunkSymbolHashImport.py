@@ -42,12 +42,25 @@ if selected_file.getName() != expected_file_name:
 println("Located '{}'".format(expected_file_name))
 
 # map of CRT builtin functions by their adler32 hash
-# specifically those which Ghidra fails to resolve on analysis,
+# specifically those which Ghidra seemingly fails to resolve on analysis,
 # these are persistent and undecorated by their nature
 crtBuiltInMap = {
+    1036191482: '__acrt_initialize',
+    117116597: '__scrt_current_native_startup_state',
+    819463716: '__scrt_fastfail',
+    3638496538: '__scrt_get_dyn_tls_dtor_callback',
+    3635023125: '__scrt_get_dyn_tls_init_callback',
+    1449920566: '__std_type_info_name',
+    138609242: '__xc_a',
+    140247667: '__xc_z',
+    139788896: '__xi_a',
+    141427321: '__xi_z',
     608961845: '_aligned_free',
     805111307: '_aligned_malloc',
+    185533148: '_c_exit',
+    102892058: '_exit',
     250676055: '_fltused',
+    629998957: '_set_app_type',
     105316889: 'fopen',
     69271971: 'free',
     145621625: 'malloc',

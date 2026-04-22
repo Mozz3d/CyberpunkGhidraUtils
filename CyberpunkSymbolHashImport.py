@@ -23,7 +23,7 @@ if not GhidraProgramUtilities.isAnalyzed(currentProgram) or analysisMgr.isAnalyz
 expected_file_name = 'cyberpunk2077_addresses.json'
 selected_file = File('{}/{}'.format(currentProgram.getExecutablePath().replace(currentProgram.getName(), ''), expected_file_name))
 
-if not selected_file:
+if not selected_file.exists():
     printerr("Could not find '{}', please locate it manually".format(expected_file_name))
     file_chooser = GhidraFileChooser(state.getTool().getActiveComponentProvider().getComponent())
     file_chooser.setSelectedFile(File(currentProgram.getExecutablePath()))
@@ -31,7 +31,7 @@ if not selected_file:
 
     selected_file = file_chooser.getSelectedFile()
 
-if not selected_file:
+if not selected_file.exists():
     printerr("No file selected, exiting")
     exit(2)
     
@@ -42,37 +42,38 @@ if selected_file.getName() != expected_file_name:
 println("Located '{}'".format(expected_file_name))
 
 # map of CRT builtin functions by their adler32 hash
-# specifically those which Ghidra seemingly fails to resolve on analysis,
+# specifically those which Ghidra fails to resolve on analysis,
 # these are persistent and undecorated by their nature
 crtBuiltInMap = {
-    1036191482: '__acrt_initialize',
-    117116597: '__scrt_current_native_startup_state',
-    819463716: '__scrt_fastfail',
-    3638496538: '__scrt_get_dyn_tls_dtor_callback',
-    3635023125: '__scrt_get_dyn_tls_init_callback',
-    1449920566: '__std_type_info_name',
-    138609242: '__xc_a',
-    140247667: '__xc_z',
-    139788896: '__xi_a',
-    141427321: '__xi_z',
-    608961845: '_aligned_free',
-    805111307: '_aligned_malloc',
-    185533148: '_c_exit',
-    102892058: '_exit',
-    250676055: '_fltused',
-    629998957: '_set_app_type',
-    105316889: 'fopen',
-    69271971: 'free',
-    145621625: 'malloc',
-    146997900: 'memcpy',
-    148374156: 'memset',
-    1099040519: 'wWinMainCRTStartup',
-    388826167: 'quick_exit'
+    '1036191482': '__acrt_initialize',
+    '117116597' : '__scrt_current_native_startup_state',
+    '819463716' : '__scrt_fastfail',
+    '3638496538': '__scrt_get_dyn_tls_dtor_callback',
+    '3635023125': '__scrt_get_dyn_tls_init_callback',
+    '1449920566': '__std_type_info_name',
+    '138609242' : '__xc_a',
+    '140247667' : '__xc_z',
+    '139788896' : '__xi_a',
+    '141427321' : '__xi_z',
+    '608961845' : '_aligned_free',
+    '805111307' : '_aligned_malloc',
+    '185533148' : '_c_exit',
+    '102892058' : '_exit',
+    '250676055' : '_fltused',
+    '629998957' : '_set_app_type',
+    '105316889' : 'fopen',
+    '69271971'  : 'free',
+    '145621625' : 'malloc',
+    '146997900' : 'memcpy',
+    '148374156' : 'memset',
+    '1099040519': 'wWinMainCRTStartup',
+    '388826167' : 'quick_exit'
 }
 
 shouldCommit = False
 start() # start transaction
 try:
+    addr_annotation_map = {}
     with open(selected_file.getPath()) as addressessFile:
         println("Parsing...")
         data = json.load(addressessFile)
@@ -85,17 +86,17 @@ try:
         
         address = block.getStart().add(offset)
         
-        _hash = int(entry['hash'])
-        secondary_hash = entry['secondary hash']
+        adler32_hash = entry['hash']
+        sha256_hash = entry['secondary hash']
         symbol = entry.get('symbol')
-        
-        comment = "Adler32: {}\nSHA256: {}".format(_hash, secondary_hash)
-        setPlateComment(address, comment)
+
+        annotation = f"Adler32: {adler32_hash}\nSHA256: {sha256_hash}"
+        addr_annotation_map.setdefault(address, set()).add(annotation)
         
         if block.isExecute():
             disassemble(address)
             createFunction(address, symbol)
-        
+
         if symbol: # create namespaces and add symbol if entry has one
             namespaces = symbol.split(Namespace.DELIMITER)
             name = namespaces.pop()
@@ -107,11 +108,16 @@ try:
             createLabel(address, name, currentNamespace, True, SourceType.IMPORTED)
             println("Imported symbol `{}` at {}".format(symbol, address))
 
-        elif _hash in crtBuiltInMap:
-            builtin = crtBuiltInMap[_hash]
+        elif adler32_hash in crtBuiltInMap:
+            builtin = crtBuiltInMap[adler32_hash]
             createLabel(address, builtin, True, SourceType.IMPORTED)
             println("Found symbol `{}` at {}".format(builtin, address))
     
+    for addr, annotations in addr_annotation_map.items():
+        existingComment = getPlateComment(addr) or ""
+        annotations_comment = "\n".join(a for a in annotations if a not in existingComment)
+        setPlateComment(addr, f"{annotations_comment.strip()}\n{existingComment}".strip())
+
     shouldCommit = True
     println("Imports successful!")
     
@@ -121,4 +127,3 @@ try:
             time.sleep(2)
 finally:
     end(shouldCommit) # end transaction
-

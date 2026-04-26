@@ -20,26 +20,26 @@ if not GhidraProgramUtilities.isAnalyzed(currentProgram) or analysisMgr.isAnalyz
     printerr("Please analyze the program first, exiting")
     exit(1)
 
-expected_file_name = 'cyberpunk2077_addresses.json'
-selected_file = File('{}/{}'.format(currentProgram.getExecutablePath().replace(currentProgram.getName(), ''), expected_file_name))
+expectedFileName = 'cyberpunk2077_addresses.json'
+selectedFile = File('{}/{}'.format(currentProgram.getExecutablePath().replace(currentProgram.getName(), ''), expectedFileName))
 
-if not selected_file.exists():
-    printerr("Could not find '{}', please locate it manually".format(expected_file_name))
-    file_chooser = GhidraFileChooser(state.getTool().getActiveComponentProvider().getComponent())
-    file_chooser.setSelectedFile(File(currentProgram.getExecutablePath()))
-    file_chooser.setTitle("Locate '{}'".format(expected_file_name))
+if not selectedFile.exists():
+    printerr("Could not find '{}', please locate it manually".format(expectedFileName))
+    fileChooser = GhidraFileChooser(state.getTool().getActiveComponentProvider().getComponent())
+    fileChooser.setSelectedFile(File(currentProgram.getExecutablePath()))
+    fileChooser.setTitle("Locate '{}'".format(expectedFileName))
 
-    selected_file = file_chooser.getSelectedFile()
+    selectedFile = fileChooser.getSelectedFile()
 
-if not selected_file.exists():
+if not selectedFile.exists():
     printerr("No file selected, exiting")
     exit(2)
     
-if selected_file.getName() != expected_file_name:
-    printerr("File selected is not '{}'".format(expected_file_name))
+if selectedFile.getName() != expectedFileName:
+    printerr("File selected is not '{}'".format(expectedFileName))
     exit(3)
 
-println("Located '{}'".format(expected_file_name))
+println("Located '{}'".format(expectedFileName))
 
 # map of CRT builtin functions by their adler32 hash
 # specifically those which Ghidra fails to resolve on analysis,
@@ -73,12 +73,16 @@ crtBuiltInMap = {
 shouldCommit = False
 start() # start transaction
 try:
-    addr_annotation_map = {}
-    with open(selected_file.getPath()) as addressessFile:
+    currentProgram.setEventsEnabled(False)
+    addrAnnotationMap = {}
+    with open(selectedFile.getPath()) as addressessFile:
         println("Parsing...")
         data = json.load(addressessFile)
 
     for entry in data['Addresses']:
+        if monitor.isCancelled():
+            quit(0)
+
         location = entry['offset'].split(':') # block & block relative offset
         
         block = getMemoryBlocks()[int(location[0])]
@@ -86,12 +90,12 @@ try:
         
         address = block.getStart().add(offset)
         
-        adler32_hash = entry['hash']
-        sha256_hash = entry['secondary hash']
+        adler32 = entry['hash']
+        sha256 = entry['secondary hash']
         symbol = entry.get('symbol')
 
-        annotation = f"Adler32: {adler32_hash}\nSHA256: {sha256_hash}"
-        addr_annotation_map.setdefault(address, set()).add(annotation)
+        annotation = f"Adler32: {adler32}\nSHA256: {sha256}"
+        addrAnnotationMap.setdefault(address, set()).add(annotation)
         
         if block.isExecute():
             disassemble(address)
@@ -108,22 +112,30 @@ try:
             createLabel(address, name, currentNamespace, True, SourceType.IMPORTED)
             println("Imported symbol `{}` at {}".format(symbol, address))
 
-        elif adler32_hash in crtBuiltInMap:
-            builtin = crtBuiltInMap[adler32_hash]
+        elif adler32 in crtBuiltInMap:
+            builtin = crtBuiltInMap[adler32]
             createLabel(address, builtin, True, SourceType.IMPORTED)
             println("Found symbol `{}` at {}".format(builtin, address))
     
-    for addr, annotations in addr_annotation_map.items():
+    for addr, annotations in addrAnnotationMap.items():
+        if monitor.isCancelled():
+            quit(0)
         existingComment = getPlateComment(addr) or ""
-        annotations_comment = "\n".join(a for a in annotations if a not in existingComment)
-        setPlateComment(addr, f"{annotations_comment.strip()}\n{existingComment}".strip())
+        annotationsComment = "\n".join(a for a in annotations if a not in existingComment)
+        setPlateComment(addr, f"{annotationsComment.strip()}\n{existingComment}".strip())
 
     shouldCommit = True
     println("Imports successful!")
+    
+    currentProgram.setEventsEnabled(True)
     
     if analysisMgr.isAnalyzing():
         println("Awaiting analysis...")
         while analysisMgr.isAnalyzing():
             time.sleep(2)
+except SystemExit:
+    pass
+except Exception as e:
+    raise
 finally:
     end(shouldCommit) # end transaction

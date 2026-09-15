@@ -5,16 +5,16 @@ A collection of Ghidra scripts for reverse engineering Cyberpunk 2077 (Windows x
 Cyberpunk 2077 ships a linker-derived (Adler32/SHA256) hash-address map (`cyberpunk2077_addresses.json`).
 Naturally this means hashes are derived from the decorated names of symbols emitted by the compiler, which the linker reads and maps.
 
-By understanding how the compiler decorates names, these scripts build templates which are ran across information found in the binary
+By understanding how the compiler decorates names, these scripts build templates which are run across information found in the binary
 to identify source data and its location.
 
 ---
 
 ## Requirements
 
-- **Completed auto-analysis**.
+- **Completed auto-analysis**
 - **PyGhidra** (bundled since Ghidra 11.3)
-- **`cyberpunk2077_addresses.json`** from the **same version** as the relevant executable.
+- **`cyberpunk2077_addresses.json`** from the **same version** as the relevant executable
 
 ---
 
@@ -38,19 +38,18 @@ Run **`CyberpunkOneShotAnalyze.py`**. It imports hashes, then derives strings an
 
 ### Stepwise
 
-First **`CyberpunkSymbolHashImport.py`**:
+#### First: **`CyberpunkSymbolHashImport.py`**
 
 The derivers read hashes back out of the plate comments the importer writes, 
 therefore it must be run **and committed** first.
-
 Attempts to locate `cyberpunk2077_addresses.json` automatically, if not then you must direct it.
 
-Second **`CyberpunkStringDeriver.py`**:
+#### Second: **`CyberpunkStringDeriver.py`**
 
 Deriving strings first makes identifying class names more consistent,
 therefore this is best run before the RTTI deriver.
 
-Lastly **`CyberpunkRTTIDeriver.py`**:
+#### Lastly: **`CyberpunkRTTIDeriver.py`**
 
 The most prolific of the scripts, best run last as it requires information from the others.
 

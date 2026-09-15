@@ -13,18 +13,13 @@ import sys
 import tempfile
 import zlib
 
-from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from itertools import combinations, chain
 
 from ghidra.program.model.address import AddressSet
-from ghidra.program.model.symbol import Namespace, SourceType, RefType
+from ghidra.program.model.symbol import SourceType, RefType
 
-from ghidra.app.util.demangler.microsoft import (
-    MicrosoftDemangler,
-    MicrosoftMangledContext,
-    MicrosoftDemanglerOptions,
-)
+from ghidra.app.util.demangler.microsoft import MicrosoftDemangler
 
 current_program = currentProgram
 listing = current_program.getListing()
@@ -32,10 +27,195 @@ errors = []
 found_classes = []
 num_derived = 0
 
+FUNDAMENTALS = (
+    'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'M', 'N', '_J', '_K', '_N', '_W',
+)
+
+SLOT_NAMES = (
+    'decorated',
+    'cls_decorated',
+    'cls_back_refs',
+    'copy_spec',
+    'variant_index',
+    'fundamental',
+)
+
+TEMPLATE_FIELD_RE = re.compile(r'\{(\w+)\}')
+
+def compileTemplates(templates, names):
+    compiled = []
+    for template in templates:
+        parts = TEMPLATE_FIELD_RE.split(template)
+        head = parts[0].encode('utf-8')
+        compiled.append((
+            head,
+            zlib.adler32(head),
+            tuple(
+                (names.index(parts[index]), parts[index + 1].encode('utf-8'))
+                for index in range(1, len(parts), 2)
+            ),
+        ))
+    return tuple(compiled)
+
+
+def packSlots(names, **values):
+    return tuple(values.get(name, '').encode('utf-8') for name in names)
+
+
+def rollSteps(state, steps, slots):
+    for slot, static in steps:
+        state = zlib.adler32(static, zlib.adler32(slots[slot], state))
+    return state
+
+
+def joinSteps(head, steps, slots):
+    parts = [head]
+    for slot, static in steps:
+        parts.append(slots[slot])
+        parts.append(static)
+    return b''.join(parts)
+
+
+CLASS_FUNCTIONS = compileTemplates((
+    "??0{decorated}@@QEAA@XZ",
+    "??0{decorated}@@AEAA@XZ",
+    "??0{decorated}@@IEAA@XZ",
+    "??0{decorated}@@QEAA@AEB{cls_back_refs}@@Z",
+    "??0{decorated}@@QEAA@$$QEA{cls_back_refs}@@Z",
+
+    "??0{decorated}@@QEAA@V?$THandle@{cls_decorated}@@@@@Z",
+    "??0{decorated}@@QEAA@AEBV?$THandle@{cls_decorated}@@@@@Z",
+    "??0?$THandle@{cls_decorated}@@@@QEAA@XZ",
+    "??0?$WeakHandle@{cls_decorated}@@@@QEAA@XZ",
+    "??1{decorated}@@UEAA@XZ",
+    "??1{decorated}@@QEAA@XZ",
+    "??1?$DynArray@{cls_decorated}@@@red@@QEAA@XZ",
+    "??1?$SharedStorage@{cls_decorated}@@VAtomicSharedStorage@internal@red@@X@red@@QEAA@XZ",
+    "??1?$THandle@{cls_decorated}@@@@QEAA@XZ",
+    "??1?$WeakHandle@{cls_decorated}@@@@QEAA@XZ",
+    "??4{decorated}@@QEAAAEA{cls_back_refs}@AEB{cls_back_refs}@@Z",
+    "??4{decorated}@@QEAAAEA{cls_back_refs}@$$QEA{cls_back_refs}@@Z",
+    "??4?$DynArray@{cls_decorated}@@@red@@QEAAAEAV01@AEBV01@@Z",
+    "??4?$DynArray@{cls_decorated}@@@red@@QEAAAEAV01@$$QEAV01@@Z",
+    "??4?$SharedStorage@{cls_decorated}@@VAtomicSharedStorage@internal@red@@X@red@@QEAAAEAV01@AEBV01@@Z",
+    "??4?$THandle@{cls_decorated}@@@@QEAAAEAV0@AEBV0@@Z",
+    "??4?$THandle@{cls_decorated}@@@@QEAAAEAV0@$$QEAV0@@Z",
+    "??8{decorated}@@QEBA_NAEB{cls_back_refs}@@Z",
+    "??9{decorated}@@QEBA_NAEB{cls_back_refs}@@Z",
+    "??Y{decorated}@@QEAAAEA{cls_back_refs}@AEB{cls_back_refs}@@Z",
+    "??_G{decorated}@@UEAAPEAXI@Z",
+
+    "??_G?$TNativeClass{copy_spec}@{cls_decorated}@@@rtti@@UEAAPEAXI@Z",
+    "?Copy@?$TNativeClass{copy_spec}@{cls_decorated}@@@rtti@@EEBAXPEAXPEBX@Z",
+    "?OnConstruct@?$TNativeClass{copy_spec}@{cls_decorated}@@@rtti@@EEBAXPEAX@Z",
+    "?OnDestruct@?$TNativeClass{copy_spec}@{cls_decorated}@@@rtti@@EEBAXPEAX@Z",
+
+    "??$IsA@{cls_decorated}@@@ClassType@rtti@@QEBA_NXZ",
+    "??$CreateObject@{cls_decorated}@@@ClassType@rtti@@QEBAPEA{cls_decorated}@@XZ",
+    "??$CreateHandle@{cls_decorated}@@$$V@@YA?AV?$THandle@{cls_decorated}@@@@XZ",
+    "??$CreateUniquePtr@{cls_decorated}@@$$V@red@@YA?AV?$UniquePtr@{cls_decorated}@@VDefaultUniquePtrDestructor@memory@red@@@0@XZ",
+    "??$CreateSharedPtr@{cls_decorated}@@$$V@red@@YA?AV?$SharedStorage@{cls_decorated}@@VAtomicSharedStorage@internal@red@@X@0@XZ",
+
+    "??$GetTypeObject@{cls_decorated}@@@@YAPEBVIType@rtti@@XZ",
+    "??$GetTypeObject@V?$DynArray@{cls_decorated}@@@red@@@@YAPEBVIType@rtti@@XZ",
+    "??$GetTypeObject@V?$THandle@{cls_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
+    "??$GetTypeObject@V?$WeakHandle@{cls_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
+
+    "?GetNativeClass@{decorated}@@UEBAPEBVClassType@rtti@@XZ",
+    "?GetClass@{decorated}@@UEBAPEBVClassType@rtti@@XZ",
+    "?GetFriendlyName@{decorated}@@UEBA?AVString@red@@XZ",
+    "?GetFriendlyDescription@{decorated}@@UEBAPEBDXZ",
+    "?GetDescription@{decorated}@@UEBA?AVString@red@@XZ",
+    "?RegisterProperties@{decorated}@@SAXPEAVClassType@rtti@@@Z",
+
+    "??$GetNativeTypeHash@{cls_decorated}@@@@YA_KXZ",
+    "??$GetNativeTypeHash@V?$DynArray@{cls_decorated}@@@red@@@@YA_KXZ",
+    "??$GetNativeTypeHash@V?$DynArray@V?$THandle@{cls_decorated}@@@@@red@@@@YA_KXZ",
+    "??$GetNativeTypeHash@V?$THandle@{cls_decorated}@@@@@@YA_KXZ",
+    "??$GetNativeTypeHash@V?$WeakHandle@{cls_decorated}@@@@@@YA_KXZ",
+
+    "??$ResolveRttiType@{cls_decorated}@@@@YAPEBVIType@rtti@@XZ",
+    "??$ResolveRttiType@V?$THandle@{cls_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
+    "??$ResolveRttiType@V?$WeakHandle@{cls_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
+    "??$ResolveRttiType@V?$TResRef@{cls_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
+    "??$ResolveRttiType@V?$TResAsyncRef@{cls_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
+    "??$ResolveRttiType@V?$DynArray@{cls_decorated}@@@red@@@@YAPEBVIType@rtti@@XZ",
+    "??$ResolveRttiType@V?$DynArray@V?$THandle@{cls_decorated}@@@@@red@@@@YAPEBVIType@rtti@@XZ",
+    "??$ResolveRttiType@V?$DynArray@V?$WeakHandle@{cls_decorated}@@@@@red@@@@YAPEBVIType@rtti@@XZ",
+    "??$ResolveRttiType@V?$DynArray@V?$TResRef@{cls_decorated}@@@@@red@@@@YAPEBVIType@rtti@@XZ",
+    "??$ResolveRttiType@V?$DynArray@V?$TResAsyncRef@{cls_decorated}@@@@@red@@@@YAPEBVIType@rtti@@XZ",
+
+    "?GetMemoryPool@{decorated}@@UEBAAEBVPool@memory@red@@XZ",
+
+    "??_G?$DataUpdater@{cls_decorated}@@@TweakDB@data@game@@UEAAPEAXI@Z",
+
+    "?Clear@?$DynArray@{cls_decorated}@@@red@@QEAAXXZ",
+    "?Empty@?$DynArray@{cls_decorated}@@@red@@QEBA_NXZ",
+    "?PushBack@?$DynArray@{cls_decorated}@@@red@@QEAAXAEB{cls_decorated}@@@Z",
+    "?PushBack@?$DynArray@{cls_decorated}@@@red@@QEAAX$$QEA{cls_decorated}@@@Z",
+    "?Reserve@?$DynArray@{cls_decorated}@@@red@@QEAAXI@Z",
+    "?Resize@?$DynArray@{cls_decorated}@@@red@@QEAAXI@Z",
+    "?ResizeBuffer@?$DynArray@{cls_decorated}@@@red@@IEAAXI@Z",
+
+    "?OnPreSave@{decorated}@@UEAAXAEBUPreSaveContext@@@Z",
+    "?OnPostLoad@{decorated}@@UEAAXAEBUPostLoadContext@@@Z",
+    "?OnPropertyPreChange@{decorated}@@UEAA_NAEBVAccessPath@rtti@@AEAV?$SharedStorage@$$CBVValueHolder@rtti@@VAtomicSharedStorage@internal@red@@X@red@@@Z",
+    "?OnPropertyPostChange@{decorated}@@UEAAXAEBVAccessPath@rtti@@AEBV?$SharedStorage@VValueHolder@rtti@@VAtomicSharedStorage@internal@red@@X@red@@1@Z",
+    "?OnSerialize@{decorated}@@EEAAXAEAVIFile@@@Z",
+    "?OnPropertyMissing@{decorated}@@UEAA_NVCName@@AEBVVariant@rtti@@@Z",
+    "?OnPropertyTypeMismatch@{decorated}@@UEAA_NVCName@@PEBVProperty@rtti@@AEBVVariant@{variant_index}@@Z",
+    "?GetPath@{decorated}@@UEBA?AVResourcePath@res@@XZ",
+    "?GetSchemaHash@{decorated}@@UEBAIXZ",
+
+    "??$HandleFromThis@{cls_decorated}@@@ISerializable@@QEBA?AV?$THandle@{cls_decorated}@@@@XZ",
+    "??$WeakHandleFromThis@{cls_decorated}@@@ISerializable@@QEBA?AV?$WeakHandle@{cls_decorated}@@@@XZ",
+    "??$HandleFromPtr@{cls_decorated}@@@@YA?AV?$THandle@{cls_decorated}@@@@PEB{cls_decorated}@@@Z",
+), SLOT_NAMES)
+
+CLASS_DATA = compileTemplates((
+    "?sm_classDesc@{decorated}@@0PEBVClassType@rtti@@EB",
+    "?nativeTypeHash@?1???$GetNativeTypeHash@V?$DynArray@{cls_decorated}@@@red@@@@YA_KXZ@4IA",
+    "?nativeTypeHash@?1???$GetNativeTypeHash@V?$DynArray@V?$THandle@{cls_decorated}@@@@@red@@@@YA_KXZ@4IA",
+    "?nativeTypeHash@?1???$GetNativeTypeHash@V?$THandle@{cls_decorated}@@@@@@YA_KXZ@4IA",
+    "?nativeTypeHash@?1???$GetNativeTypeHash@V?$WeakHandle@{cls_decorated}@@@@@@YA_KXZ@4IA",
+    "?rttiType@?1???$GetTypeObject@{cls_decorated}@@@@YAPEBVIType@rtti@@XZ@4PEBV12@EB",
+    "?rttiType@?1???$GetTypeObject@V?$DynArray@{cls_decorated}@@@red@@@@YAPEBVIType@rtti@@XZ@4PEBV12@EB",
+    "?rttiType@?1???$GetTypeObject@V?$THandle@{cls_decorated}@@@@@@YAPEBVIType@rtti@@XZ@4PEBV12@EB",
+    "?rttiType@?1???$GetTypeObject@V?$WeakHandle@{cls_decorated}@@@@@@YAPEBVIType@rtti@@XZ@4PEBV12@EB",
+    "?theName@?1??GetTypeName@?$TTypeName@{cls_decorated}@@@@SA?BVCName@@XZ@4V3@A",
+), SLOT_NAMES)
+
+FUNDAMENTAL_FUNCTIONS = compileTemplates((
+    "??$ResolveRttiType@{fundamental}@@YAPEBVIType@rtti@@XZ",
+    "??$ResolveRttiType@V?$DynArray@{fundamental}@red@@@@YAPEBVIType@rtti@@XZ",
+    "??$GetNativeTypeHash@{fundamental}@@YA_KXZ",
+    "??1?$DynArray@{fundamental}@red@@QEAA@XZ",
+    "??4?$DynArray@{fundamental}@red@@QEAAAEAV01@AEBV01@@Z",
+    "?Empty@?$DynArray@{fundamental}@red@@QEBA_NXZ",
+    "?PushBack@?$DynArray@{fundamental}@red@@QEAAXAEB{fundamental}@Z",
+    "?PushBack@?$DynArray@{fundamental}@red@@QEAAX$$QEA{fundamental}@Z",
+    "?Reserve@?$DynArray@{fundamental}@red@@QEAAXI@Z",
+    "?Resize@?$DynArray@{fundamental}@red@@QEAAXI@Z",
+), SLOT_NAMES)
+
+FUNDAMENTAL_DATA = compileTemplates((
+    "?nativeTypeHash@?1???$GetNativeTypeHash@{fundamental}@@YA_KXZ@4IA",
+    "?nativeTypeHash@?1???$GetNativeTypeHash@V?$DynArray@{fundamental}@red@@@@YA_KXZ@4IA",
+    "?theName@?1??GetTypeName@?$TTypeName@{fundamental}@@SA?BVCName@@XZ@4V3@A",
+), SLOT_NAMES)
+
+NATIVE_TYPE_HASH_HEAD = b"?nativeTypeHash@?1???$GetNativeTypeHash@"
+NATIVE_TYPE_HASH_TAIL = b"@@@@YA_KXZ@4IA"
+NATIVE_TYPE_HASH_KEYS = tuple(
+    (cls_key, zlib.adler32(NATIVE_TYPE_HASH_HEAD + cls_key), cls_key.decode('utf-8'))
+    for cls_key in (b'V', b'U')
+)
+
 
 def quitIfCancelled():
     if monitor.isCancelled():
         quit()
+
 
 class demangling:
     ms = MicrosoftDemangler()
@@ -46,7 +226,7 @@ class demangling:
         return demangling.ms.demangle(
             demangling.ms.createMangledContext(mangled, demangling.options, current_program, None)
         )
-    
+
     @staticmethod
     def label(addr, mangled):
         global num_derived
@@ -55,32 +235,17 @@ class demangling:
             ns = demangled.createNamespace(current_program, demangled.getNamespace(), None, True)
             createLabel(addr, demangled.getName(), ns, True, SourceType.ANALYSIS)
             createLabel(addr, demangled.getMangledString(), False, SourceType.ANALYSIS)
-            # for whatever reason, setting and getting plate comments is exceedingly slow...
-            # so much so that the script takes extrememly long when attempting to do so.
-            # maybe find a fix?
-            # setPlateComment(addr, f"{getPlateComment(addr)}\n{str(demangled).strip()}\n")
             num_derived += 1
             println(f"Derived `{str(demangled).strip()}` at {addr}")
         except Exception as e:
             errors.append(f"Could not apply label '{str(demangled).strip()}' at {addr}: {e}")
 
 
-class hashing:
-    @staticmethod
-    def adler32(data_bytes):
-        return int(zlib.adler32(data_bytes))
-
-    @staticmethod
-    def sha256(data_bytes):
-        return int.from_bytes(hashlib.sha256(data_bytes).digest(), 'big')
-
-
 class resolving:
-    seen_strings = set()
     seen_namespaces = set()
 
     _ADLER32_RE = re.compile(r'Adler32: (\b\d+\b)')
-    _SHA256_RE  = re.compile(r'SHA256: ([a-f0-9]{64})')
+    _SHA256_RE = re.compile(r'SHA256: ([a-f0-9]{64})')
 
     adler32_hashes = set()
     block_sha256_maps = []
@@ -90,22 +255,61 @@ class resolving:
         comment = getPlateComment(addr)
         if not comment:
             return (), ()
-        a32s    = (int(m)     for m in resolving._ADLER32_RE.findall(comment))
+        a32s = (int(m) for m in resolving._ADLER32_RE.findall(comment))
         sha256s = (int(m, 16) for m in resolving._SHA256_RE.findall(comment))
         return a32s, sha256s
 
     @staticmethod
+    def templateHits(templates, slots):
+        hashes = resolving.adler32_hashes
+        for head, head_state, steps in templates:
+            if rollSteps(head_state, steps, slots) in hashes:
+                yield joinSteps(head, steps, slots)
+
+    @staticmethod
+    def findEncoded(encoded, block_idx):
+        return resolving.block_sha256_maps[block_idx].get(
+            int.from_bytes(hashlib.sha256(encoded).digest(), 'big')
+        )
+
+    @staticmethod
+    def findEncodedThenLabel(encoded, block_idx):
+        if addr := resolving.findEncoded(encoded, block_idx):
+            demangling.label(addr, encoded.decode('utf-8'))
+            return addr
+
+    @staticmethod
     def findMangled(mangled, block_idx=1):
-        mangled_encoded = mangled.encode('utf-8')
-        if hashing.adler32(mangled_encoded) in resolving.adler32_hashes:
-            return resolving.block_sha256_maps[block_idx].get(hashing.sha256(mangled_encoded))
-    
+        encoded = mangled.encode('utf-8')
+        if zlib.adler32(encoded) in resolving.adler32_hashes:
+            return resolving.findEncoded(encoded, block_idx)
+
     @staticmethod
     def findMangledThenLabel(mangled, block_idx):
         if addr := resolving.findMangled(mangled, block_idx):
             demangling.label(addr, mangled)
             return addr
-    
+
+    @staticmethod
+    def labelUnwind(encoded):
+        global num_derived
+        unwind = b"$unwind$" + encoded
+        if zlib.adler32(unwind) in resolving.adler32_hashes:
+            if addr := resolving.findEncoded(unwind, 2):
+                createLabel(addr, unwind.decode('utf-8'), False, SourceType.ANALYSIS)
+                num_derived += 1
+
+    @staticmethod
+    def findNativeTypeHash(decorated):
+        encoded_decorated = decorated.encode('utf-8')
+        for cls_key, head_state, cls_key_text in NATIVE_TYPE_HASH_KEYS:
+            rolled = zlib.adler32(NATIVE_TYPE_HASH_TAIL, zlib.adler32(encoded_decorated, head_state))
+            if rolled not in resolving.adler32_hashes:
+                continue
+            encoded = NATIVE_TYPE_HASH_HEAD + cls_key + encoded_decorated + NATIVE_TYPE_HASH_TAIL
+            if addr := resolving.findEncoded(encoded, 3):
+                return cls_key_text, addr, encoded.decode('utf-8')
+
     @staticmethod
     def generateQualifiers(conjoined_name):
         name_len = len(conjoined_name)
@@ -120,7 +324,6 @@ class resolving:
         for num_delimiters in range(max_delimiters + 1):
             max_compressed_pos = name_len - num_delimiters
             for compressed_positions in combinations(range(start_pos, max_compressed_pos + 1), num_delimiters):
-                # expand into gap of at least 2 characters
                 positions = (compressed_pos + idx for idx, compressed_pos in enumerate(compressed_positions))
                 qualifiers = []
                 last_pos = 0
@@ -132,16 +335,13 @@ class resolving:
 
     @staticmethod
     def resolveClassTypes():
-        if not hasattr(resolving.resolveClassTypes, 'class_type_ctor_func'):
-            class_type_ctor_mangled = '??0ClassType@rtti@@QEAA@VCName@@II@Z'
-            if addr := resolving.findMangledThenLabel(class_type_ctor_mangled, 1):
-                resolving.resolveClassTypes.class_type_ctor_func = getFunctionAt(addr)
-                println(f"Located `rtti::ClassType::ClassType` at {addr}")
-            else:
-                raise RuntimeError("Could not locate `rtti::ClassType::ClassType`, are hashes imported?")
+        class_type_ctor_mangled = '??0ClassType@rtti@@QEAA@VCName@@II@Z'
+        class_type_ctor_addr = resolving.findMangledThenLabel(class_type_ctor_mangled, 1)
+        if class_type_ctor_addr is None:
+            raise RuntimeError("Could not locate `rtti::ClassType::ClassType`, are hashes imported?")
+        println(f"Located `rtti::ClassType::ClassType` at {class_type_ctor_addr}")
 
-        class_type_ctor_func = resolving.resolveClassTypes.class_type_ctor_func
-        for init_func in class_type_ctor_func.getCallingFunctions(monitor):
+        for init_func in getFunctionAt(class_type_ctor_addr).getCallingFunctions(monitor):
             conjoined_name = None
             for instr in listing.getInstructions(init_func.getBody(), True):
                 ref = instr.getPrimaryReference(1)
@@ -166,49 +366,284 @@ class resolving:
 
             for potential_quals in resolving.generateQualifiers(conjoined_name):
                 quals = tuple(reversed(potential_quals))
-                decorated = '@'.join(quals)
-                for mangled, cls_key in (
-                    (f"?nativeTypeHash@?1???$GetNativeTypeHash@V{decorated}@@@@YA_KXZ@4IA", 'V'),
-                    (f"?nativeTypeHash@?1???$GetNativeTypeHash@U{decorated}@@@@YA_KXZ@4IA", 'U'),
-                ):
-                    if addr := resolving.findMangled(mangled, 3):
-                        if len(potential_quals) > 1 and (qual := potential_quals[0]) and len(qual) > 2:
-                            resolving.seen_namespaces.add(qual)
-                        yield cls_key, quals, addr, mangled
-                        break
-                else:
-                    continue
-                break
+                if found := resolving.findNativeTypeHash('@'.join(quals)):
+                    cls_key, addr, mangled = found
+                    if len(potential_quals) > 1 and (qual := potential_quals[0]) and len(qual) > 2:
+                        resolving.seen_namespaces.add(qual)
+                    yield cls_key, quals, addr, mangled
+                    break
 
     @staticmethod
     def resolveUniqueTypes():
         for name in (
-            "Box",
+            "Box@math",
+            "CDateTime",
             "CName",
             "DataBuffer",
             "DeferredDataBuffer@serialization",
-            "EulerAngles",
-            "QsTransform",
-            "Quaternion",
+            "EulerAngles@math",
+            "QsTransform@math",
+            "Quaternion@math",
+            "SharedDataBuffer",
             "String@red",
             "TweakDBID@data@game",
-            "Vector2",
-            "Vector3",
-            "Vector4",
+            "Vector2@math",
+            "Vector3@math",
+            "Vector4@math",
         ):
-            for mangled, cls_key in (
-                (f"?nativeTypeHash@?1???$GetNativeTypeHash@V{name}@@@@YA_KXZ@4IA", 'V'),
-                (f"?nativeTypeHash@?1???$GetNativeTypeHash@U{name}@@@@YA_KXZ@4IA", 'U'),
-            ):
-                if native_type_hash_addr := resolving.findMangled(mangled, 3):
-                    yield cls_key, tuple(name.split('@')), native_type_hash_addr, mangled
-                    break
+            if found := resolving.findNativeTypeHash(name):
+                cls_key, addr, mangled = found
+                yield cls_key, tuple(name.split('@')), addr, mangled
 
-#
-#
-# Entry
-#
-#
+
+CROSS_WORKER_SOURCE = '''
+import re
+import zlib
+
+found_classes = ()
+adler32_hashes = frozenset()
+
+FUNDAMENTALS = ()
+
+TEMPLATE_FIELD_RE = re.compile(r'\\{(\\w+)\\}')
+
+CONTAINER_SLOT = ('container',)
+SIGNATURE_SLOTS = ('key_type', 'value_type', 'key_sig', 'value_sig')
+CONTAINER_SLOTS = CONTAINER_SLOT + SIGNATURE_SLOTS
+
+CROSS_OUTER_SLOTS = ('out_decorated', 'out_cls_decorated', 'out_cls_back_refs')
+CROSS_INNER_SLOTS = ('in_param', 'in_arg', 'in_connector', 'in_cls_decorated', 'in_param_quals')
+CROSS_SLOTS = CROSS_OUTER_SLOTS + CROSS_INNER_SLOTS
+
+
+def compileTemplates(templates, names):
+    compiled = []
+    for template in templates:
+        parts = TEMPLATE_FIELD_RE.split(template)
+        head = parts[0].encode('utf-8')
+        compiled.append((
+            head,
+            zlib.adler32(head),
+            tuple(
+                (names.index(parts[index]), parts[index + 1].encode('utf-8'))
+                for index in range(1, len(parts), 2)
+            ),
+        ))
+    return tuple(compiled)
+
+
+def compileCrossTemplates(templates):
+    compiled = []
+    for template in templates:
+        parts = TEMPLATE_FIELD_RE.split(template)
+        steps = tuple(
+            (CROSS_SLOTS.index(parts[index]), parts[index + 1].encode('utf-8'))
+            for index in range(1, len(parts), 2)
+        )
+        split = next(
+            (index for index, (slot, _) in enumerate(steps) if CROSS_SLOTS[slot] in CROSS_INNER_SLOTS),
+            len(steps),
+        )
+        head = parts[0].encode('utf-8')
+        compiled.append((head, zlib.adler32(head), steps[:split], steps[split:]))
+    return tuple(compiled)
+
+
+def packSlots(names, **values):
+    return tuple(values.get(name, '').encode('utf-8') for name in names)
+
+
+def rollSteps(state, steps, slots):
+    for slot, static in steps:
+        state = zlib.adler32(static, zlib.adler32(slots[slot], state))
+    return state
+
+
+def joinSteps(head, steps, slots):
+    parts = [head]
+    for slot, static in steps:
+        parts.append(slots[slot])
+        parts.append(static)
+    return b''.join(parts)
+
+
+CONTAINER_TEMPLATES = compileTemplates((
+    "??0{container}QEAA@AEBV01@@Z",
+    "??0{container}QEAA@$$QEAV01@@Z",
+    "??1{container}QEAA@XZ",
+    "??4{container}QEAAAEAV01@AEBV01@@Z",
+    "??4{container}QEAAAEAV01@$$QEAV01@@Z",
+    "??A{container}QEAAAEA{value_sig}AEB{key_sig}@Z",
+    "??A{container}QEBAAEB{value_sig}AEB{key_sig}@Z",
+    "?Clear@{container}QEAAXXZ",
+    "?GetKeys@{container}QEBA?AV?$DynArray@{key_type}@2@XZ",
+    "?GetValues@{container}QEBAXAEAV?$DynArray@{value_type}@2@@Z",
+    "?GetValues@{container}QEBA?AV?$DynArray@{value_type}@2@XZ",
+    "?Reserve@{container}QEAAXI@Z",
+    "?Shrink@{container}QEAAXXZ",
+), CONTAINER_SLOTS)
+
+CROSS_FUNCTIONS = compileCrossTemplates((
+    "??0{out_decorated}@@QEAA@{in_param}@Z",
+    "??0{out_decorated}@@QEAA@AEA{in_param}@Z",
+    "??0{out_decorated}@@QEAA@AEB{in_param}@Z",
+    "??0{out_decorated}@@QEAA@PEA{in_param}@Z",
+    "??0{out_decorated}@@QEAA@PEB{in_param}@Z",
+    "??0{out_decorated}@@QEAA@$$QEA{in_param}@Z",
+    "??0{out_decorated}@@QEAA@V?$THandle@{in_cls_decorated}@@@@@Z",
+    "??0{out_decorated}@@QEAA@AEBV?$THandle@{in_cls_decorated}@@@@@Z",
+    "??0{out_decorated}@@QEAA@V?$WeakHandle@{in_cls_decorated}@@@@@Z",
+    "??0{out_decorated}@@QEAA@AEBV?$WeakHandle@{in_cls_decorated}@@@@@Z",
+    "??$CreateHandle@{out_cls_decorated}@@AEA{in_arg}@@@YA?AV?$THandle@{out_cls_decorated}@@@@AEA{in_param}@Z",
+    "??$CreateSharedPtr@{out_cls_decorated}@@AEA{in_arg}@@red@@YA?AV?$SharedStorage@{out_cls_decorated}@@VAtomicSharedStorage@internal@red@@X@1@AEA{in_param}@Z",
+    "??$CreateUniquePtr@{out_cls_decorated}@@AEA{in_arg}@@red@@YA?AV?$UniquePtr@{out_cls_decorated}@@VDefaultUniquePtrDestructor@memory@red@@@1@AEA{in_param}@Z",
+    "??4{out_decorated}@@QEAAAEA{out_cls_back_refs}@AEB{in_param}@Z",
+    "??4?$THandle@{out_cls_decorated}@@@@QEAAAEAV0@AEBV?$THandle@{in_cls_decorated}@@@@@Z",
+    "??4?$THandle@{out_cls_decorated}@@@@QEAAAEAV0@$$QEAV?$THandle@{in_cls_decorated}@@@@@Z",
+    "??$Cast@{out_cls_decorated}@@{in_arg}@@@YAPEA{out_cls_decorated}@@PEA{in_param}@Z",
+    "??$Cast@{out_cls_decorated}@@{in_arg}@@@YA?AV?$THandle@{out_cls_decorated}@@@@AEBV?$THandle@{in_cls_decorated}@@@@@Z",
+    "??$RegisterEventConnector@{out_cls_decorated}@@{in_arg}@@rtti@@YAXVCName@@PEAVClassType@0@P8{out_decorated}@@EAAXAEB{in_connector}@@Z@Z",
+))
+
+CROSS_VFTABLE = compileCrossTemplates((
+    "??_7{out_decorated}@@6B{in_param_quals}@@",
+))
+
+
+def configure(classes, hashes, fundamentals):
+    global found_classes, adler32_hashes, FUNDAMENTALS
+    found_classes, adler32_hashes, FUNDAMENTALS = classes, hashes, fundamentals
+
+
+def containerHits(key_type, key_quals, value_type, value_quals):
+    arg_refs = ("",) + key_quals
+    if any(qual in arg_refs for qual in value_quals):
+        value_arg = value_type[0] + "".join(
+            str(arg_refs.index(qual)) if qual in arg_refs else f"{qual}@"
+            for qual in value_quals) + "@"
+    else:
+        value_arg = value_type
+
+    policy_refs = arg_refs + tuple(qual for qual in value_quals if qual not in arg_refs)
+    red_ref = str(policy_refs.index("red")) if "red" in policy_refs else "red@"
+
+    value_sig = value_type if not value_quals else value_type[0] + "".join(
+        "1" if qual == "red" else f"{qual}@" for qual in value_quals) + "@"
+    sig_refs = ("", "red") + tuple(qual for qual in value_quals if qual != "red")
+    key_sig = key_type if not key_quals else key_type[0] + "".join(
+        str(sig_refs.index(qual)) if qual in sig_refs else f"{qual}@"
+        for qual in key_quals) + "@"
+
+    adler32, hashes = zlib.adler32, adler32_hashes
+    signature_slots = packSlots(
+        SIGNATURE_SLOTS,
+        key_type=key_type,
+        value_type=value_type,
+        key_sig=key_sig,
+        value_sig=value_sig,
+    )
+
+    for container in (
+        f"?$HashMap@{key_type}{value_arg}U?$DefaultHashPolicy@{key_type}@{red_ref}@@red@@",
+        f"?$Map@{key_type}{value_arg}U?$less@{key_type}@std@@@red@@",
+    ):
+        slots = (container.encode('utf-8'),) + signature_slots
+        for head, head_state, steps in CONTAINER_TEMPLATES:
+            checksum = head_state
+            for slot, static in steps:
+                checksum = adler32(static, adler32(slots[slot], checksum))
+            if checksum in hashes:
+                yield joinSteps(head, steps, slots).decode('utf-8'), 1
+
+
+def crossHits(entry):
+    out_cls_key, out_decorated, out_quals, out_cls_decorated = entry
+    arg_refs = ("",) + out_quals
+    connector_refs = ("rtti", "CName", "ClassType") + out_quals
+    out_full = out_cls_decorated + "@@"
+
+    outer_slots = packSlots(
+        CROSS_OUTER_SLOTS,
+        out_decorated=out_decorated,
+        out_cls_decorated=out_cls_decorated,
+        out_cls_back_refs=out_cls_key + "0123456789"[:len(out_quals)],
+    )
+    adler32, hashes = zlib.adler32, adler32_hashes
+    prepared_slots = outer_slots + packSlots(CROSS_INNER_SLOTS)
+    prepared_functions = tuple(
+        (joinSteps(head, outer, prepared_slots), rollSteps(head_state, outer, prepared_slots), inner)
+        for head, head_state, outer, inner in CROSS_FUNCTIONS
+    )
+    prepared_vftable = tuple(
+        (joinSteps(head, outer, prepared_slots), rollSteps(head_state, outer, prepared_slots), inner)
+        for head, head_state, outer, inner in CROSS_VFTABLE
+    )
+
+    yield from containerHits(out_full, out_quals, out_full, out_quals)
+    for fundamental in FUNDAMENTALS:
+        yield from containerHits(out_full, out_quals, fundamental, ())
+        yield from containerHits(fundamental, (), out_full, out_quals)
+
+        slots = outer_slots + packSlots(CROSS_INNER_SLOTS, in_param=fundamental)
+        for prefix, state, inner in prepared_functions:
+            checksum = state
+            for slot, static in inner:
+                checksum = adler32(static, adler32(slots[slot], checksum))
+            if checksum in hashes:
+                yield (prefix + joinSteps(b'', inner, slots)).decode('utf-8'), 1
+
+    for in_cls_key, in_decorated, in_quals, in_cls_decorated in found_classes:
+        if in_decorated == out_decorated:
+            continue
+
+        if any(qual in out_quals for qual in in_quals):
+            arg_quals = "".join(
+                str(arg_refs.index(qual)) if qual in arg_refs else f"{qual}@"
+                for qual in in_quals)
+            param_quals = "".join(
+                str(out_quals.index(qual)) if qual in out_quals else f"{qual}@"
+                for qual in in_quals)
+        else:
+            arg_quals = param_quals = f"{in_decorated}@"
+
+        if any(qual in connector_refs for qual in in_quals):
+            connector_quals = "".join(
+                str(connector_refs.index(qual)) if qual in connector_refs else f"{qual}@"
+                for qual in in_quals)
+        else:
+            connector_quals = param_quals
+
+        slots = outer_slots + packSlots(
+            CROSS_INNER_SLOTS,
+            in_param=f"{in_cls_key}{param_quals}@",
+            in_arg=f"{in_cls_key}{arg_quals}",
+            in_connector=f"{in_cls_key}{connector_quals}",
+            in_cls_decorated=in_cls_decorated,
+            in_param_quals=param_quals,
+        )
+
+        for prefix, state, inner in prepared_functions:
+            checksum = state
+            for slot, static in inner:
+                checksum = adler32(static, adler32(slots[slot], checksum))
+            if checksum in hashes:
+                yield (prefix + joinSteps(b'', inner, slots)).decode('utf-8'), 1
+
+        for prefix, state, inner in prepared_vftable:
+            checksum = state
+            for slot, static in inner:
+                checksum = adler32(static, adler32(slots[slot], checksum))
+            if checksum in hashes:
+                yield (prefix + joinSteps(b'', inner, slots)).decode('utf-8'), 2
+
+        yield from containerHits(out_full, out_quals, in_cls_decorated + "@@", in_quals)
+
+
+def findCrossPairs(entry):
+    return list(crossHits(entry))
+'''
+
+
 println(f"Building hash-address maps...")
 for block in getMemoryBlocks():
     sha256_map = {}
@@ -221,268 +656,72 @@ for block in getMemoryBlocks():
     resolving.block_sha256_maps.append(sha256_map)
 
 should_commit = False
-start()  # start transaction
+start()
 try:
-    current_program.setEventsEnabled(False) # prevents event thrashing lag
-    
+    current_program.setEventsEnabled(False)
+
     for cls_key, quals, native_type_hash_addr, native_type_hash_mangled in chain(
         resolving.resolveClassTypes(),
         resolving.resolveUniqueTypes(),
     ):
         quitIfCancelled()
-        decorated = '@'.join(quals)
         demangling.label(native_type_hash_addr, native_type_hash_mangled)
 
+        decorated = '@'.join(quals)
+        cls_decorated = f"{cls_key}{decorated}"
+        found_classes.append((cls_key, decorated, quals, cls_decorated))
+
         copy_spec = ''
-        cls_key_and_decorated = f"{cls_key}{decorated}"
-        cls_key_and_back_refs = f"{cls_key}{'0123456789'[:len(quals)]}"
-        
-        found_classes.append((
-            cls_key.encode('utf-8'),
-            decorated.encode('utf-8'),
-            tuple(qual.encode('utf-8') for qual in quals),
-            cls_key_and_decorated.encode('utf-8'),
-        ))
-        
-        
         for mangled, is_no_copy in (
-            (f"??_7?$TNativeClass@{cls_key_and_decorated}@@@rtti@@6B@",       False),
-            (f"??_7?$TNativeClassNoCopy@{cls_key_and_decorated}@@@rtti@@6B@", True),
+            (f"??_7?$TNativeClass@{cls_decorated}@@@rtti@@6B@", False),
+            (f"??_7?$TNativeClassNoCopy@{cls_decorated}@@@rtti@@6B@", True),
         ):
             if resolving.findMangledThenLabel(mangled, 2):
                 if is_no_copy:
                     copy_spec = 'NoCopy'
                 break
-        
-        for mangled in (
-            f"??0{decorated}@@QEAA@XZ",
-            f"??0{decorated}@@AEAA@XZ",
-            f"??0{decorated}@@IEAA@XZ",
-            f"??0{decorated}@@QEAA@AEB{cls_key_and_back_refs}@@Z",
-            f"??0{decorated}@@QEAA@$$QEA{cls_key_and_back_refs}@@Z",
-            f"??0?$THandle@{cls_key_and_decorated}@@@@QEAA@XZ",
-            f"??0?$WeakHandle@{cls_key_and_decorated}@@@@QEAA@XZ",
-            f"??1{decorated}@@UEAA@XZ",
-            f"??1{decorated}@@QEAA@XZ",
-            f"??1?$DynArray@{cls_key_and_decorated}@@@red@@QEAA@XZ",
-            f"??1?$THandle@{cls_key_and_decorated}@@@@QEAA@XZ",
-            f"??1?$WeakHandle@{cls_key_and_decorated}@@@@QEAA@XZ",
-            f"??4{decorated}@@QEAAAEA{cls_key_and_back_refs}@AEB{cls_key_and_back_refs}@@Z",
-            f"??4{decorated}@@QEAAAEB{cls_key_and_back_refs}@AEB{cls_key_and_back_refs}@@Z",
-            f"??4{decorated}@@QEAAAEA{cls_key_and_back_refs}@$$QEA{cls_key_and_back_refs}@@Z",
-            f"??4?$DynArray@{cls_key_and_decorated}@@@red@@QEAAAEAV01@AEBV01@@Z",
-            f"??4?$DynArray@{cls_key_and_decorated}@@@red@@QEAAAEAV01@$$QEAV01@@Z",
-            f"??4?$THandle@{cls_key_and_decorated}@@@@QEAAAEAV0@AEBV0@@Z",
-            f"??4?$THandle@{cls_key_and_decorated}@@@@QEAAAEAV0@$$QEAV0@@Z",
-            f"??8{decorated}@@QEBA_NAEB{cls_key_and_back_refs}@@Z",
-            f"??9{decorated}@@QEBA_NAEB{cls_key_and_back_refs}@@Z",
-            f"??Y{decorated}@@QEAAAEA{cls_key_and_back_refs}@AEB{cls_key_and_back_refs}@@Z",
-            f"??_G{decorated}@@UEAAPEAXI@Z",
-            
-            f"??1?$TNativeClass{copy_spec}@{cls_key_and_decorated}@@@rtti@@UEAA@XZ",
-            f"??_G?$TNativeClass{copy_spec}@{cls_key_and_decorated}@@@rtti@@UEAAPEAXI@Z",
-            f"?Copy@?$TNativeClass{copy_spec}@{cls_key_and_decorated}@@@rtti@@EEBAXPEAXPEBX@Z",
-            f"?OnConstruct@?$TNativeClass{copy_spec}@{cls_key_and_decorated}@@@rtti@@EEBAXPEAX@Z",
-            f"?OnDestruct@?$TNativeClass{copy_spec}@{cls_key_and_decorated}@@@rtti@@EEBAXPEAX@Z",
-            
-            f"??$IsA@{cls_key_and_decorated}@@@ClassType@rtti@@QEBA_NXZ",
-            f"??$CreateObject@{cls_key_and_decorated}@@@ClassType@rtti@@QEBAPEA{cls_key_and_decorated}@@XZ",
-            f"??$CreateHandle@{cls_key_and_decorated}@@$$V@@YA?AV?$THandle@{cls_key_and_decorated}@@@@XZ",
-            f"??$CreateUniquePtr@{cls_key_and_decorated}@@$$V@red@@YA?AV?$UniquePtr@{cls_key_and_decorated}@@VDefaultUniquePtrDestructor@memory@red@@@0@XZ",
-            
-            f"??$GetTypeObject@{cls_key_and_decorated}@@@@YAPEBVIType@rtti@@XZ",
-            f"??$GetTypeObject@V?$DynArray@{cls_key_and_decorated}@@@red@@@@YAPEBVIType@rtti@@XZ",
-            f"??$GetTypeObject@V?$THandle@{cls_key_and_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
-            f"??$GetTypeObject@V?$WeakHandle@{cls_key_and_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
-            
-            f"?GetNativeClass@{decorated}@@UEBAPEBVClassType@rtti@@XZ",
-            f"?GetClass@{decorated}@@UEBAPEBVClassType@rtti@@XZ",
-            f"?GetFriendlyName@{decorated}@@UEBA?AVString@red@@XZ",
-            f"?GetFriendlyDescription@{decorated}@@UEBAPEBDXZ",
-            f"?GetDescription@{decorated}@@UEBA?AVString@red@@XZ",
-            f"?RegisterProperties@{decorated}@@SAXPEAVClassType@rtti@@@Z",
-            
-            f"??$GetNativeTypeHash@{cls_key_and_decorated}@@@@YA_KXZ",
-            f"??$GetNativeTypeHash@V?$DynArray@{cls_key_and_decorated}@@@red@@@@YA_KXZ",
-            f"??$GetNativeTypeHash@V?$DynArray@V?$THandle@{cls_key_and_decorated}@@@@@red@@@@YA_KXZ",
-            f"??$GetNativeTypeHash@V?$THandle@{cls_key_and_decorated}@@@@@@YA_KXZ",
-            f"??$GetNativeTypeHash@V?$WeakHandle@{cls_key_and_decorated}@@@@@@YA_KXZ",
-            
-            f"??$ResolveRttiType@{cls_key_and_decorated}@@@@YAPEBVIType@rtti@@XZ",
-            f"??$ResolveRttiType@V?$THandle@{cls_key_and_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
-            f"??$ResolveRttiType@V?$WeakHandle@{cls_key_and_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
-            f"??$ResolveRttiType@V?$TResRef@{cls_key_and_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
-            f"??$ResolveRttiType@V?$TResAsyncRef@{cls_key_and_decorated}@@@@@@YAPEBVIType@rtti@@XZ",
-            f"??$ResolveRttiType@V?$DynArray@{cls_key_and_decorated}@@@red@@@@YAPEBVIType@rtti@@XZ",
-            f"??$ResolveRttiType@V?$DynArray@V?$THandle@{cls_key_and_decorated}@@@@@red@@@@YAPEBVIType@rtti@@XZ",
-            f"??$ResolveRttiType@V?$DynArray@V?$WeakHandle@{cls_key_and_decorated}@@@@@red@@@@YAPEBVIType@rtti@@XZ",
-            f"??$ResolveRttiType@V?$DynArray@V?$TResRef@{cls_key_and_decorated}@@@@@red@@@@YAPEBVIType@rtti@@XZ",
-            f"??$ResolveRttiType@V?$DynArray@V?$TResAsyncRef@{cls_key_and_decorated}@@@@@red@@@@YAPEBVIType@rtti@@XZ",
 
-            f"?GetMemoryPool@{decorated}@@UEBAAEBVPool@memory@red@@XZ",
+        slots = packSlots(
+            SLOT_NAMES,
+            decorated=decorated,
+            cls_decorated=cls_decorated,
+            cls_back_refs=f"{cls_key}{'0123456789'[:len(quals)]}",
+            copy_spec=copy_spec,
+            variant_index=str(len(quals) + 3),
+        )
 
-            f"??_G?$DataUpdater@{cls_key_and_decorated}@@@TweakDB@data@game@@UEAAPEAXI@Z",
-            
-            f"?Clear@?$DynArray@{cls_key_and_decorated}@@@red@@QEAAXXZ",
-            f"?Empty@?$DynArray@{cls_key_and_decorated}@@@red@@QEBA_NXZ",
-            f"?PushBack@?$DynArray@{cls_key_and_decorated}@@@red@@QEAAXAEB{cls_key_and_decorated}@@@Z",
-            f"?PushBack@?$DynArray@{cls_key_and_decorated}@@@red@@QEAAX$$QEA{cls_key_and_decorated}@@@Z",
-            f"?Reserve@?$DynArray@{cls_key_and_decorated}@@@red@@QEAAXI@Z",
-            f"?Resize@?$DynArray@{cls_key_and_decorated}@@@red@@QEAAXI@Z",
-            f"?ResizeBuffer@?$DynArray@{cls_key_and_decorated}@@@red@@IEAAXI@Z",
+        for encoded in resolving.templateHits(CLASS_FUNCTIONS, slots):
+            if resolving.findEncodedThenLabel(encoded, 1):
+                resolving.labelUnwind(encoded)
 
-            f"?OnPreSave@{decorated}@@UEAAXAEBUPreSaveContext@@@Z",
-            f"?OnPostLoad@{decorated}@@UEAAXAEBUPostLoadContext@@@Z",
-            f"?OnPropertyPreChange@{decorated}@@UEAA_NAEBVAccessPath@rtti@@AEAV?$SharedStorage@$$CBVValueHolder@rtti@@VAtomicSharedStorage@internal@red@@X@red@@@Z",
-            f"?OnPropertyPostChange@{decorated}@@UEAAXAEBVAccessPath@rtti@@AEBV?$SharedStorage@VValueHolder@rtti@@VAtomicSharedStorage@internal@red@@X@red@@1@Z",
-            f"?OnSerialize@{decorated}@@EEAAXAEAVIFile@@@Z",
-            f"?OnPropertyMissing@{decorated}@@UEAA_NVCName@@AEBVVariant@rtti@@@Z",
-            f"?OnPropertyTypeMismatch@{decorated}@@UEAA_NVCName@@PEBVProperty@rtti@@AEBVVariant@{len(quals) + 3}@@Z",
-            f"?GetPath@{decorated}@@UEBA?AVResourcePath@res@@XZ",
-            f"?GetSchemaHash@{decorated}@@UEBAIXZ",
-            f"??$HandleFromThis@{cls_key_and_decorated}@@@ISerializable@@QEBA?AV?$THandle@{cls_key_and_decorated}@@@@XZ",
-            f"??$WeakHandleFromThis@{cls_key_and_decorated}@@@ISerializable@@QEBA?AV?$WeakHandle@{cls_key_and_decorated}@@@@XZ",
-            f"??$HandleFromPtr@{cls_key_and_decorated}@@@@YA?AV?$THandle@{cls_key_and_decorated}@@@@PEB{cls_key_and_decorated}@@@Z"
-        ):
-            if resolving.findMangledThenLabel(mangled, 1):
-                unwind_mangled = f"$unwind${mangled}" # Function unwind info
-                if addr := resolving.findMangled(unwind_mangled, 2):
-                    createLabel(addr, unwind_mangled, False, SourceType.ANALYSIS)
-                    num_derived += 1
-        
         resolving.findMangledThenLabel(f"??_7{decorated}@@6B@", 2)
-        
-        for mangled in (
-            f"?sm_classDesc@{decorated}@@0PEBVClassType@rtti@@EB",
-            f"?nativeTypeHash@?1???$GetNativeTypeHash@V?$DynArray@{cls_key_and_decorated}@@@red@@@@YA_KXZ@4IA",
-            f"?nativeTypeHash@?1???$GetNativeTypeHash@V?$DynArray@V?$THandle@{cls_key_and_decorated}@@@@@red@@@@YA_KXZ@4IA",
-            f"?nativeTypeHash@?1???$GetNativeTypeHash@V?$THandle@{cls_key_and_decorated}@@@@@@YA_KXZ@4IA",
-            f"?nativeTypeHash@?1???$GetNativeTypeHash@V?$WeakHandle@{cls_key_and_decorated}@@@@@@YA_KXZ@4IA",
-            f"?rttiType@?1???$GetTypeObject@{cls_key_and_decorated}@@@@YAPEBVIType@rtti@@XZ@4PEBV12@EB",
-            f"?rttiType@?1???$GetTypeObject@V?$DynArray@{cls_key_and_decorated}@@@red@@@@YAPEBVIType@rtti@@XZ@4PEBV12@EB",
-            f"?rttiType@?1???$GetTypeObject@V?$THandle@{cls_key_and_decorated}@@@@@@YAPEBVIType@rtti@@XZ@4PEBV12@EB",
-            f"?rttiType@?1???$GetTypeObject@V?$WeakHandle@{cls_key_and_decorated}@@@@@@YAPEBVIType@rtti@@XZ@4PEBV12@EB",
-            f"?theName@?1??GetTypeName@?$TTypeName@{cls_key_and_decorated}@@@@SA?BVCName@@XZ@4V3@A",
-        ):
-            resolving.findMangledThenLabel(mangled, 3)
 
-    for fundamental in ('C', 'D', 'E', 'F', 'G', 'H', 'I', 'M', 'N', '_J', '_K', '_N'):
+        for encoded in resolving.templateHits(CLASS_DATA, slots):
+            resolving.findEncodedThenLabel(encoded, 3)
+
+    for fundamental in FUNDAMENTALS:
         quitIfCancelled()
-        for mangled in (
-            f"??$ResolveRttiType@{fundamental}@@YAPEBVIType@rtti@@XZ",
-            f"??$ResolveRttiType@V?$DynArray@{fundamental}@red@@@@YAPEBVIType@rtti@@XZ",
-            f"??$GetNativeTypeHash@{fundamental}@@YA_KXZ",
-            f"??1?$DynArray@{fundamental}@red@@QEAA@XZ",
-            f"??4?$DynArray@{fundamental}@red@@QEAAAEAV01@AEBV01@@Z",
-            f"?Clear@?$DynArray@{fundamental}@red@@QEAAXXZ",
-            f"?Empty@?$DynArray@{fundamental}@red@@QEBA_NXZ",
-            f"?PushBack@?$DynArray@{fundamental}@red@@QEAAXAEB{fundamental}@Z",
-            f"?PushBack@?$DynArray@{fundamental}@red@@QEAAX$$QEA{fundamental}@Z",
-            f"?Reserve@?$DynArray@{fundamental}@red@@QEAAXI@Z",
-            f"?Resize@?$DynArray@{fundamental}@red@@QEAAXI@Z",
-            f"?ResizeBuffer@?$DynArray@{fundamental}@red@@IEAAXI@Z"
-        ):
-            resolving.findMangledThenLabel(mangled, 1)
+        slots = packSlots(SLOT_NAMES, fundamental=fundamental)
 
-        for mangled in (
-            f"?nativeTypeHash@?1???$GetNativeTypeHash@{fundamental}@@YA_KXZ@4IA",
-            f"?nativeTypeHash@?1???$GetNativeTypeHash@V?$DynArray@{fundamental}@red@@@@YA_KXZ@4IA",
-            f"?theName@?1??GetTypeName@?$TTypeName@{fundamental}@@SA?BVCName@@XZ@4V3@A"
-        ):
-            resolving.findMangledThenLabel(mangled, 3)
-    
-    CROSS_WORKER_SOURCE = '''
-import zlib
+        for encoded in resolving.templateHits(FUNDAMENTAL_FUNCTIONS, slots):
+            resolving.findEncodedThenLabel(encoded, 1)
 
-found_classes = ()
-adler32_hashes = frozenset()
+        for encoded in resolving.templateHits(FUNDAMENTAL_DATA, slots):
+            resolving.findEncodedThenLabel(encoded, 3)
 
-
-def configure(classes, hashes):
-    global found_classes, adler32_hashes
-    found_classes, adler32_hashes = classes, hashes
-
-
-def findCrossPairs(entry):
-    out_cls_key, out_decorated, out_quals, out_cls_key_and_decorated = entry
-    arg_refs = (b"",) + out_quals
-    connector_refs = (b"rtti", b"CName", b"ClassType") + out_quals
-    out_back_refs = out_cls_key + b"0123456789"[:len(out_quals)]
-
-    object_variants = tuple((prefix, zlib.adler32(prefix)) for prefix in (
-        b"??0" + out_decorated + b"@@QEAA@AEB",
-        b"??0" + out_decorated + b"@@QEAA@$$QEA",
-        b"??4" + out_decorated + b"@@QEAAAEA" + out_back_refs + b"@AEB",
-        b"??4" + out_decorated + b"@@QEAAAEA" + out_back_refs + b"@$$QEA",
-        b"??8" + out_decorated + b"@@QEBA_NAEB",
-        b"??9" + out_decorated + b"@@QEBA_NAEB",
-        b"??Y" + out_decorated + b"@@QEAAAEA" + out_back_refs + b"@AEB",
-    ))
-    cast_prefix = b"??$Cast@" + out_cls_key_and_decorated + b"@@"
-    cast_prehash = zlib.adler32(cast_prefix)
-    cast_middle = b"@@@YAPEA" + out_cls_key_and_decorated + b"@@PEA"
-    handle_cast_middle = b"@@@YA?AV?$THandle@" + out_cls_key_and_decorated + b"@@@@AEBV?$THandle@"
-
-    connector_prefix = b"??$RegisterEventConnector@" + out_cls_key_and_decorated + b"@@"
-    connector_prehash = zlib.adler32(connector_prefix)
-    connector_middles = tuple(
-        b"@@rtti@@YAXVCName@@PEAVClassType@0@P8" + out_decorated + b"@@" + qualifier + b"XAEB"
-        for qualifier in (b"EAA", b"EBA"))
-
-    vftable_prefix = b"??_7" + out_decorated + b"@@6B"
-    vftable_prehash = zlib.adler32(vftable_prefix)
-
-    hits = []
-    for in_cls_key, in_decorated, in_quals, in_cls_key_and_decorated in found_classes:
-        if in_decorated == out_decorated:
-            continue
-
-        if any(qual in out_quals for qual in in_quals):
-            arg_quals = b"".join(
-                b"%d" % arg_refs.index(qual) if qual in arg_refs else qual + b"@"
-                for qual in in_quals)
-            param_quals = b"".join(
-                b"%d" % out_quals.index(qual) if qual in out_quals else qual + b"@"
-                for qual in in_quals)
-        else:
-            arg_quals = param_quals = in_decorated + b"@"
-
-        if any(qual in connector_refs for qual in in_quals):
-            connector_quals = b"".join(
-                b"%d" % connector_refs.index(qual) if qual in connector_refs else qual + b"@"
-                for qual in in_quals)
-        else:
-            connector_quals = param_quals
-
-        param_tail = in_cls_key + param_quals + b"@@Z"
-        cast_body = in_cls_key + arg_quals + cast_middle
-        handle_cast_body = in_cls_key + arg_quals + handle_cast_middle
-        handle_cast_tail = in_cls_key_and_decorated + b"@@@@@Z"
-        connector_tail = in_cls_key + connector_quals + b"@@Z@Z"
-        vftable_tail = param_quals + b"@@"
-
-        for prefix, prehash in object_variants:
-            if zlib.adler32(param_tail, prehash) in adler32_hashes:
-                hits.append((prefix + param_tail, 1))
-        if zlib.adler32(param_tail, zlib.adler32(cast_body, cast_prehash)) in adler32_hashes:
-            hits.append((cast_prefix + cast_body + param_tail, 1))
-        if zlib.adler32(handle_cast_tail, zlib.adler32(handle_cast_body, cast_prehash)) in adler32_hashes:
-            hits.append((cast_prefix + handle_cast_body + handle_cast_tail, 1))
-        for connector_middle in connector_middles:
-            connector_body = in_cls_key + arg_quals + connector_middle
-            if zlib.adler32(connector_tail, zlib.adler32(connector_body, connector_prehash)) in adler32_hashes:
-                hits.append((connector_prefix + connector_body + connector_tail, 1))
-        if zlib.adler32(vftable_tail, vftable_prehash) in adler32_hashes:
-            hits.append((vftable_prefix + vftable_tail, 2))
-    return hits
-'''
-    
     worker_dir = tempfile.mkdtemp(prefix='ghidra_cross_')
     with open(os.path.join(worker_dir, 'crossworker.py'), 'w') as handle:
         handle.write(CROSS_WORKER_SOURCE)
     sys.path.insert(0, worker_dir)
     sys.modules.pop('crossworker', None)
     import crossworker
+
+    crossworker.configure((), frozenset(resolving.adler32_hashes), FUNDAMENTALS)
+    for key_fundamental in FUNDAMENTALS:
+        quitIfCancelled()
+        for value_fundamental in FUNDAMENTALS:
+            for mangled, block_idx in crossworker.containerHits(key_fundamental, (), value_fundamental, ()):
+                resolving.findMangledThenLabel(mangled, block_idx)
 
     interpreter = sys.executable
     if not os.path.basename(interpreter).lower().startswith('python'):
@@ -495,23 +734,20 @@ def findCrossPairs(entry):
         max_workers=os.cpu_count(),
         mp_context=multiprocessing.get_context('spawn'),
         initializer=crossworker.configure,
-        initargs=(found_classes, frozenset(resolving.adler32_hashes)),
+        initargs=(found_classes, frozenset(resolving.adler32_hashes), FUNDAMENTALS),
     ) as executor:
         for hits in executor.map(crossworker.findCrossPairs, found_classes, chunksize=32):
             if monitor.isCancelled():
                 executor.shutdown(wait=False, cancel_futures=True)
                 break
-            for candidate, block_idx in hits:
-                mangled = candidate.decode('utf-8')
-                if resolving.findMangledThenLabel(mangled, block_idx) and block_idx == 1:
-                    unwind_mangled = f"$unwind${mangled}"
-                    if addr := resolving.findMangled(unwind_mangled, 2):
-                        createLabel(addr, unwind_mangled, False, SourceType.ANALYSIS)
-                        num_derived += 1
+            for mangled, block_idx in hits:
+                encoded = mangled.encode('utf-8')
+                if resolving.findEncodedThenLabel(encoded, block_idx) and block_idx == 1:
+                    resolving.labelUnwind(encoded)
     quitIfCancelled()
 
     current_program.setEventsEnabled(True)
- 
+
     for err in errors:
         printerr(err)
 
@@ -525,4 +761,4 @@ except SystemExit:
 except Exception:
     raise
 finally:
-    end(should_commit)  # end transaction
+    end(should_commit)

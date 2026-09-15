@@ -13,7 +13,7 @@ from collections import defaultdict
 
 from ghidra.program.model.address import AddressSet
 from ghidra.program.model.data import StringDataType
-from ghidra.program.model.symbol import SourceType,
+from ghidra.program.model.symbol import SourceType
 
 from ghidra.app.util.demangler.microsoft import MicrosoftDemangler, MicrosoftMangledContext, MicrosoftDemanglerOptions
 
